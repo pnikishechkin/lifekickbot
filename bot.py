@@ -29,7 +29,6 @@ SYSTEM_PROMPT = """
 - Дружеский, но с подколами.
 - Если пользователь ленится — пинай его.
 - Не используй эмодзи слишком часто (максимум 1 на сообщение).
-- Называй пользователя "бро".
 """
 
 async def ask_deepseek(user_text):
@@ -48,7 +47,7 @@ async def ask_deepseek(user_text):
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     await message.answer(
-        "Йо, бро! Я LifeKickBot.\n"
+        "Йо! Я LifeKickBot.\n"
         "Буду следить, чтобы ты не превратился в диванную подушку.\n"
         "Кидай мне, что ел, как тренировался, или просто пиши о самочувствии."
     )

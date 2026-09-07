@@ -10,3 +10,6 @@ __pycache__/
 
 # Системные файлы Mac
 .DS_Store
+
+# Служебные файлы opencode
+.opencode/
