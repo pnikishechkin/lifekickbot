@@ -1,5 +1,6 @@
 import asyncio
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -10,6 +11,10 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+for key, value in (("TELEGRAM_TOKEN", TELEGRAM_TOKEN), ("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY)):
+    if not value:
+        raise SystemExit(f"Не задан {key} в .env")
 
 # Настройка DeepSeek
 client = OpenAI(
@@ -22,26 +27,23 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 # Системный промпт — характер бота
-SYSTEM_PROMPT = """
-Ты — LifeKickBot, дерзкий друг, который помогает следить за здоровьем.
-Твой стиль:
-- Короткие фразы (1-3 предложения).
-- Дружеский, но с подколами.
-- Если пользователь ленится — пинай его.
-- Не используй эмодзи слишком часто (максимум 1 на сообщение).
-"""
+SYSTEM_PROMPT = Path(__file__).parent.joinpath("system_prompt.txt").read_text(encoding="utf-8")
 
 async def ask_deepseek(user_text):
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ],
-        temperature=0.7,
-        max_tokens=300
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Ошибка DeepSeek: {e}")
+        return None
 
 # Обработчик команды /start
 @dp.message(Command("start"))
@@ -55,9 +57,19 @@ async def start_handler(message: types.Message):
 # Обработчик всех остальных сообщений
 @dp.message()
 async def ai_handler(message: types.Message):
+    if not message.text:
+        await message.answer("Пока я читаю только текстовые сообщения. Напиши, что съел или как прошла тренировка.")
+        return
     user_text = message.text
     reply = await ask_deepseek(user_text)
-    await message.answer(reply)
+    if not reply:
+        await message.answer("Что-то пошло не так. Попробуй ещё раз чуть позже.")
+        return
+    try:
+        await message.answer(reply)
+    except Exception as e:
+        print(f"Ошибка отправки ответа: {e}")
+        await message.answer("Что-то пошло не так. Попробуй ещё раз чуть позже.")
 
 async def main():
     await dp.start_polling(bot)
