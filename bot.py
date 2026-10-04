@@ -1,11 +1,14 @@
 import asyncio
 import json
 import os
+import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from openai import OpenAI
 
@@ -34,6 +37,12 @@ dp = Dispatcher()
 CONVERSATION_WINDOW_SIZE = 20
 conversation = defaultdict(deque)
 
+MAX_REPLY_TOKENS = 1200
+REPORT_LISTING_THRESHOLD = 12
+
+_TAG_RE = re.compile(r"</?(?:b|i|code|pre|s|u)>")
+_HTML_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+
 # Системный промпт — характер бота
 SYSTEM_PROMPT = Path(__file__).parent.joinpath("system_prompt.txt").read_text(encoding="utf-8")
 
@@ -41,18 +50,56 @@ SYSTEM_PROMPT = Path(__file__).parent.joinpath("system_prompt.txt").read_text(en
 EXTRACT_PROMPT = (
     "Ты определяешь намерение в сообщении пользователя и извлекаешь данные о тренировках. "
     "Верни ТОЛЬКО JSON без пояснений в формате: "
-    '{{"intent": "workout"|"report"|"none", "report_period": "day"|"week"|"month"|"all"|null, '
+    '{{"intent": "workout"|"report"|"none", "period_from": string|null, "period_to": string|null, '
     '"kind": string|null, "details": string|null, "performed_at": string|null}}.\n'
     "intent: report — пользователь просит показать историю или отчёт о своих тренировках за период; "
     "workout — пользователь сообщает о реально выполненной тренировке или активности; "
     "none — всё остальное.\n"
-    "report_period — только для intent=report: запрошенный период (день/неделя/месяц/всё время), иначе null.\n"
+    "period_from и period_to — только для intent=report: границы запрошенного периода в формате "
+    "YYYY-MM-DD, обе включительные. Пользователь мог назвать период относительно "
+    "(«за неделю», «за месяц») или календарный («в марте», «за 2024 год», «за лето») — считай границы "
+    "от текущей даты, она указана ниже. Если период назван относительно, отсчитай его назад от текущей даты. "
+    "Если пользователь не назвал период, используй разумный период по умолчанию (последние 7 дней). "
+    "Если попросил показать всё время или всю историю — обе границы null. Если назвал только начало или только "
+    "конец — заполни только соответствующую границу, вторую оставь null.\n"
     "kind — тип активности: силовая, кардио, бег и т.п.; только для intent=workout.\n"
     "details — кратко повтори, как именно тренировался пользователь (упражнения, веса, подходы).\n"
-    "performed_at — время тренировки в ISO 8601 UTC. Текущее время UTC: {now}. "
+    "performed_at — время тренировки в ISO 8601 UTC. Текущая дата: {today} ({now}). "
     "Если пользователь не назвал время, считай, что тренировка сейчас.\n"
     "Не выдумывай ничего, чего пользователь не сообщил. Отсутствующие значения — null."
 )
+
+def strip_formatting(text):
+    """Убирает теги оформления, чтобы реплика в переписке была чистым текстом."""
+    cleaned = _TAG_RE.sub("", text)
+    for char, escaped in _HTML_ESCAPES:
+        cleaned = cleaned.replace(escaped, char)
+    return cleaned
+
+
+def escape_html(text):
+    for char, escaped in _HTML_ESCAPES:
+        text = text.replace(char, escaped)
+    return text
+
+
+async def send_reply(message, text):
+    """Отправляет ответ с разметкой, а при отказе Telegram — без неё.
+
+    Пользователь всегда получает текст: сначала пробуем разметку, при отказе
+    отправляем экранированный текст и сообщаем о проблеме с оформлением.
+    """
+    try:
+        await message.answer(text, parse_mode=ParseMode.HTML)
+        return
+    except TelegramBadRequest as e:
+        print(f"Telegram отклонил разметку: {e}")
+    await message.answer(
+        escape_html(text)
+        + "\n\n(Не смог оформить ответ — показал его без оформления.)",
+        parse_mode=ParseMode.HTML,
+    )
+
 
 async def ask_deepseek(messages):
     try:
@@ -60,53 +107,56 @@ async def ask_deepseek(messages):
             model="deepseek-chat",
             messages=messages,
             temperature=0.7,
-            max_tokens=300
+            max_tokens=MAX_REPLY_TOKENS
         )
         return response.choices[0].message.content
     except Exception as e:
         print(f"Ошибка DeepSeek: {e}")
         return None
+def _format_workout_line(w):
+    label = f"{w['performed_at'][:10]} — {w['kind'] or 'тренировка'}"
+    if w["details"]:
+        label += f" ({w['details']})"
+    return label
+
 
 def build_workout_digest(user_id, limit=5):
     workouts = storage.get_workouts(user_id, limit=limit)
     if not workouts:
         return "Тренировок пока нет."
-    lines = []
-    for w in workouts:
-        label = f"{w['performed_at'][:10]} — {w['kind'] or 'тренировка'}"
-        if w["details"]:
-            label += f" ({w['details']})"
-        lines.append(label)
+    lines = [_format_workout_line(w) for w in workouts]
     return "Последние тренировки пользователя:\n" + "\n".join(lines)
 
-def period_since(period):
-    if period == "day":
-        return (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    if period == "week":
-        return (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    if period == "month":
-        return (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    return None
 
-def build_report_context(user_id, period):
-    since = period_since(period)
-    workouts = storage.get_workouts(user_id, since=since) if since else storage.get_workouts(user_id)
+def _records_word(count):
+    if count % 10 == 1 and count % 100 != 11:
+        return "запись"
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return "записи"
+    return "записей"
+
+
+def build_report_context(user_id, period_from=None, period_to=None):
+    workouts = storage.get_workouts(user_id, period_from=period_from, period_to=period_to)
     if not workouts:
         return "Тренировок за запрошенный период нет."
-    lines = []
-    for w in workouts:
-        label = f"{w['performed_at'][:10]} — {w['kind'] or 'тренировка'}"
-        if w["details"]:
-            label += f" ({w['details']})"
-        lines.append(label)
-    return "Тренировки пользователя за запрошенный период:\n" + "\n".join(lines)
+    count = len(workouts)
+    header = f"Тренировки пользователя за запрошенный период: {count} {_records_word(count)}."
+    lines = [_format_workout_line(w) for w in workouts]
+    return header + "\n" + "\n".join(lines)
 
 async def extract_workout(user_text):
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": EXTRACT_PROMPT.format(now=datetime.now(timezone.utc).isoformat())},
+                {
+                    "role": "system",
+                    "content": EXTRACT_PROMPT.format(
+                        today=datetime.now(timezone.utc).date().isoformat(),
+                        now=datetime.now(timezone.utc).isoformat(),
+                    ),
+                },
                 {"role": "user", "content": user_text}
             ],
             temperature=0,
@@ -125,9 +175,9 @@ async def extract_workout(user_text):
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     await message.answer(
-        "Йо! Я LifeKickBot.\n"
-        "Буду следить, чтобы ты не превратился в диванную подушку.\n"
-        "Кидай мне, что ел, как тренировался, или просто пиши о самочувствии."
+        "Я LifeKickBot — твой тренер по образу жизни.\n"
+        "Буду следить за тренировками, едой и привычками, чтобы прогресс не сливался.\n"
+        "Пиши, что ел, как тренировался или что чувствуешь. Спроси отчёт — соберу по данным."
     )
 
 # Обработчик всех остальных сообщений
@@ -154,7 +204,11 @@ async def ai_handler(message: types.Message):
         )
         facts_content = build_workout_digest(user_id)
     elif intent == "report":
-        facts_content = build_report_context(user_id, extraction.get("report_period"))
+        facts_content = build_report_context(
+            user_id,
+            period_from=extraction.get("period_from"),
+            period_to=extraction.get("period_to"),
+        )
     else:
         facts_content = build_workout_digest(user_id)
 
@@ -172,14 +226,10 @@ async def ai_handler(message: types.Message):
     if not reply:
         await message.answer("Что-то пошло не так. Попробуй ещё раз чуть позже.")
         return
-    history.append({"role": "assistant", "content": reply})
+    history.append({"role": "assistant", "content": strip_formatting(reply)})
     while len(history) > CONVERSATION_WINDOW_SIZE:
         history.popleft()
-    try:
-        await message.answer(reply)
-    except Exception as e:
-        print(f"Ошибка отправки ответа: {e}")
-        await message.answer("Что-то пошло не так. Попробуй ещё раз чуть позже.")
+    await send_reply(message, reply)
 
 async def main():
     storage.init_db()
